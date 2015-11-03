@@ -107,7 +107,6 @@ class TextEditorComponent
     @disposables.dispose()
     @presenter.destroy()
     @gutterContainerComponent?.destroy()
-    window.removeEventListener 'resize', @requestHeightAndWidthMeasurement
 
   getDomNode: ->
     @domNode
@@ -224,7 +223,6 @@ class TextEditorComponent
     @domNode.addEventListener 'textInput', @onTextInput
     @scrollViewNode.addEventListener 'mousedown', @onMouseDown
     @scrollViewNode.addEventListener 'scroll', @onScrollViewScroll
-    window.addEventListener 'resize', @requestHeightAndWidthMeasurement
 
     @listenForIMEEvents()
     @trackSelectionClipboard() if process.platform is 'linux'
@@ -405,8 +403,8 @@ class TextEditorComponent
       when 3
         @editor.getLastSelection().selectLine()
 
-    @handleDragUntilMouseUp event, (screenPosition) =>
-      @editor.selectToScreenPosition(screenPosition)
+    @handleDragUntilMouseUp (screenPosition) =>
+      @editor.selectToScreenPosition(screenPosition, true)
 
   onLineNumberGutterMouseDown: (event) =>
     return unless event.button is 0 # only handle the left mouse button
@@ -421,63 +419,36 @@ class TextEditorComponent
       @onGutterClick(event)
 
   onGutterClick: (event) =>
-    clickedRow = @screenPositionForMouseEvent(event).row
-    clickedBufferRow = @editor.bufferRowForScreenRow(clickedRow)
-
+    clickedBufferRow = @editor.bufferRowForScreenRow(@screenPositionForMouseEvent(event).row)
     @editor.setSelectedBufferRange([[clickedBufferRow, 0], [clickedBufferRow + 1, 0]], preserveFolds: true)
-
-    @handleDragUntilMouseUp event, (screenPosition) =>
-      dragRow = screenPosition.row
-      dragBufferRow = @editor.bufferRowForScreenRow(dragRow)
-      if dragBufferRow < clickedBufferRow # dragging up
-        @editor.setSelectedBufferRange([[dragBufferRow, 0], [clickedBufferRow + 1, 0]], preserveFolds: true)
-      else
-        @editor.setSelectedBufferRange([[clickedBufferRow, 0], [dragBufferRow + 1, 0]], preserveFolds: true)
+    @handleGutterDrag(clickedBufferRow)
 
   onGutterMetaClick: (event) =>
-    clickedRow = @screenPositionForMouseEvent(event).row
-    clickedBufferRow = @editor.bufferRowForScreenRow(clickedRow)
-
-    bufferRange = new Range([clickedBufferRow, 0], [clickedBufferRow + 1, 0])
-    rowSelection = @editor.addSelectionForBufferRange(bufferRange, preserveFolds: true)
-
-    @handleDragUntilMouseUp event, (screenPosition) =>
-      dragRow = screenPosition.row
-      dragBufferRow = @editor.bufferRowForScreenRow(dragRow)
-
-      if dragBufferRow < clickedBufferRow # dragging up
-        rowSelection.setBufferRange([[dragBufferRow, 0], [clickedBufferRow + 1, 0]], preserveFolds: true)
-      else
-        rowSelection.setBufferRange([[clickedBufferRow, 0], [dragBufferRow + 1, 0]], preserveFolds: true)
-
-      # After updating the selected screen range, merge overlapping selections
-      @editor.mergeIntersectingSelections(preserveFolds: true)
-
-      # The merge process will possibly destroy the current selection because
-      # it will be merged into another one. Therefore, we need to obtain a
-      # reference to the new selection that contains the originally selected row
-      rowSelection = _.find @editor.getSelections(), (selection) ->
-        selection.intersectsBufferRange(bufferRange)
+    clickedBufferRow = @editor.bufferRowForScreenRow(@screenPositionForMouseEvent(event).row)
+    @editor.addSelectionForBufferRange([[clickedBufferRow, 0], [clickedBufferRow + 1, 0]], preserveFolds: true)
+    @handleGutterDrag(clickedBufferRow)
 
   onGutterShiftClick: (event) =>
-    clickedRow = @screenPositionForMouseEvent(event).row
-    clickedBufferRow = @editor.bufferRowForScreenRow(clickedRow)
-    tailPosition = @editor.getLastSelection().getTailScreenPosition()
-    tailBufferPosition = @editor.bufferPositionForScreenPosition(tailPosition)
+    clickedBufferRow = @editor.bufferRowForScreenRow(@screenPositionForMouseEvent(event).row)
+    tailBufferPosition = @editor.getLastSelection().getTailBufferPosition()
 
-    if clickedRow < tailPosition.row
-      @editor.selectToBufferPosition([clickedBufferRow, 0])
+    if clickedBufferRow < tailBufferPosition.row
+      @editor.selectToBufferPosition([clickedBufferRow, 0], true)
     else
-      @editor.selectToBufferPosition([clickedBufferRow + 1, 0])
+      @editor.selectToBufferPosition([clickedBufferRow + 1, 0], true)
 
-    @handleDragUntilMouseUp event, (screenPosition) =>
-      dragRow = screenPosition.row
-      dragBufferRow = @editor.bufferRowForScreenRow(dragRow)
-      if dragRow < tailPosition.row # dragging up
-        @editor.setSelectedBufferRange([[dragBufferRow, 0], tailBufferPosition], preserveFolds: true)
+    @handleGutterDrag(tailBufferPosition.row, tailBufferPosition.column)
+
+  handleGutterDrag: (tailRow, tailColumn) ->
+    tailPosition = [tailRow, tailColumn] if tailColumn?
+
+    @handleDragUntilMouseUp (screenPosition) =>
+      dragRow = @editor.bufferPositionForScreenPosition(screenPosition).row
+      if dragRow < tailRow
+        @editor.getLastSelection().setBufferRange([[dragRow, 0], tailPosition ? [tailRow + 1, 0]], reversed: true, autoscroll: false, preserveFolds: true)
       else
-        @editor.setSelectedBufferRange([tailBufferPosition, [dragBufferRow + 1, 0]], preserveFolds: true)
-
+        @editor.getLastSelection().setBufferRange([tailPosition ? [tailRow, 0], [dragRow + 1, 0]], reversed: false, autoscroll: false, preserveFolds: true)
+      @editor.getLastCursor().autoscroll()
 
   onStylesheetsChanged: (styleElement) =>
     return unless @performedInitialMeasurement
@@ -527,7 +498,7 @@ class TextEditorComponent
   onCursorMoved: =>
     @cursorMoved = true
 
-  handleDragUntilMouseUp: (event, dragHandler) =>
+  handleDragUntilMouseUp: (dragHandler) =>
     dragging = false
     lastMousePosition = {}
     animationLoop = =>
@@ -554,6 +525,7 @@ class TextEditorComponent
     onMouseUp = (event) =>
       stopDragging()
       @editor.finalizeSelections()
+      @editor.mergeIntersectingSelections()
       pasteSelectionClipboard(event)
 
     stopDragging = ->
@@ -588,15 +560,6 @@ class TextEditorComponent
         @wasVisible = true
     else
       @wasVisible = false
-
-  requestHeightAndWidthMeasurement: =>
-    return if @heightAndWidthMeasurementRequested
-
-    @heightAndWidthMeasurementRequested = true
-    requestAnimationFrame =>
-      @heightAndWidthMeasurementRequested = false
-      @measureDimensions()
-      @measureWindowSize()
 
   # Measure explicitly-styled height and width and relay them to the model. If
   # these values aren't explicitly styled, we assume the editor is unconstrained
@@ -729,9 +692,18 @@ class TextEditorComponent
   consolidateSelections: (e) ->
     e.abortKeyBinding() unless @editor.consolidateSelections()
 
-  lineNodeForScreenRow: (screenRow) -> @linesComponent.lineNodeForScreenRow(screenRow)
+  lineNodeForScreenRow: (screenRow) ->
+    tileRow = @presenter.tileForRow(screenRow)
+    tileComponent = @linesComponent.getComponentForTile(tileRow)
 
-  lineNumberNodeForScreenRow: (screenRow) -> @gutterContainerComponent.getLineNumberGutterComponent().lineNumberNodeForScreenRow(screenRow)
+    tileComponent?.lineNodeForScreenRow(screenRow)
+
+  lineNumberNodeForScreenRow: (screenRow) ->
+    tileRow = @presenter.tileForRow(screenRow)
+    gutterComponent = @gutterContainerComponent.getLineNumberGutterComponent()
+    tileComponent = gutterComponent.getComponentForTile(tileRow)
+
+    tileComponent?.lineNumberNodeForScreenRow(screenRow)
 
   screenRowForNode: (node) ->
     while node?
